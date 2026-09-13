@@ -3,6 +3,8 @@
 pub mod discovery;
 pub mod wire;
 
+use chrono::{DateTime, Utc};
+
 use crate::fact::{AgentKind, AgentStatus, Fact, FactKind, Outcome, Statement};
 use crate::provider::summary::{short_path, truncate_summary};
 use crate::state::session::MAIN_ID;
@@ -11,16 +13,24 @@ use wire::{Block, Entry, parse_line};
 /// One pi session file being read.
 #[derive(Debug, Clone)]
 pub struct Stream {
-    /// The node this file is by: `main` for the root, the run id for a
-    /// subagent run. Comes off the path, so it is known before any line.
+    /// The node this file is by: `main` for the root, the run id for a run
+    /// under the root's directory, the session uuid for a forked run beside
+    /// it. Comes off the path, so it is known before any line.
     owner: String,
     /// From the header, for relativising paths in summaries.
     cwd: Option<String>,
+    /// When this file's own session began. A run forked from its parent
+    /// opens with a copy of the parent's history, every entry of it older.
+    began: Option<DateTime<Utc>>,
 }
 
 impl Stream {
     pub fn new(owner: String) -> Self {
-        Stream { owner, cwd: None }
+        Stream {
+            owner,
+            cwd: None,
+            began: None,
+        }
     }
 
     /// Parse one line and state what it says. `None` for a blank or
@@ -45,6 +55,13 @@ impl Stream {
         let mut out = Vec::new();
         if entry.kind == "session" {
             self.cwd = entry.cwd.clone();
+            self.began = entry.timestamp;
+        } else if !self.is_root()
+            && let (Some(at), Some(began)) = (entry.timestamp, self.began)
+            && at < began
+        {
+            // The parent's history, copied into a forked run. Not ours.
+            return out;
         }
         if entry.kind == "session" && !self.is_root() {
             out.push(Fact {
@@ -177,16 +194,18 @@ impl Stream {
         out
     }
 
-    /// The agent in a run's session name, `subagent-<agent>-<run>-<step>`,
-    /// when the name is this run's.
+    /// The agent in a run's session name, `subagent-<agent>-<run>-<step>`.
+    /// The run id there is pi-subagents' own; a forked run's node is its
+    /// session uuid instead, so the id is dropped rather than matched.
     fn run_agent<'a>(&self, name: &'a str) -> Option<&'a str> {
         let (rest, step) = name.strip_prefix("subagent-")?.rsplit_once('-')?;
         step.parse::<u32>().ok()?;
-        rest.strip_suffix(self.owner.as_str())?.strip_suffix('-')
+        let (agent, _run) = rest.rsplit_once('-')?;
+        (!agent.is_empty()).then_some(agent)
     }
 
     /// The children a finished `subagent` call reports. A run's session file
-    /// sits in its run directory, which is the child's node; the call is its
+    /// names the child's node (see [`run_of_session_file`]); the call is its
     /// spawner, and its recorded exit code is its end. A result without
     /// `results` (a launch still running in the background, a management
     /// action) names nobody.
@@ -256,11 +275,15 @@ fn is_spawn(name: &str, call: &Block) -> bool {
     name == "subagent" && call.arguments.get("action").is_none()
 }
 
-/// The run id in a child's session file path, `…/<run>/run-<n>/session.jsonl`,
-/// written with whichever separator the host uses.
+/// A child's node id from its session file path, written with whichever
+/// separator the host uses: the run id for `…/<run>/run-<n>/session.jsonl`,
+/// the session uuid for a forked run's top-level `…/<timestamp>_<uuid>.jsonl`.
 fn run_of_session_file(path: &str) -> Option<&str> {
     let mut parts = path.rsplit(['/', '\\']);
-    (parts.next()? == "session.jsonl").then_some(())?;
+    let file = parts.next()?;
+    if file != "session.jsonl" {
+        return discovery::session_of_stem(file.strip_suffix(".jsonl")?);
+    }
     parts.next()?.strip_prefix("run-")?;
     parts.next().filter(|run| !run.is_empty())
 }
@@ -348,6 +371,59 @@ mod tests {
                 },
             }]
         );
+    }
+
+    /// A run started with `context: "fork"` is a top-level session that opens
+    /// with a copy of its parent's history, every entry older than its own
+    /// header. The copy is the parent's record, already stated by the
+    /// parent's file; the run states only what follows it. Its session name
+    /// carries a run id that is not its node id, and still labels it.
+    #[test]
+    fn forked_run_skips_the_copied_history() {
+        let mut run = Stream::new("01a097b0-1111-7222-8333-444455556666".into());
+        let header = run
+            .push(r#"{"type":"session","version":3,"id":"01a097b0-1111-7222-8333-444455556666","timestamp":"2026-09-12T21:59:00.000Z","cwd":"/p","parentSession":"/s/--p--/2026-09-12T21-48-02-988Z_01a09797-7e2c-7002-a725-c0a3455ef1c3.jsonl"}"#)
+            .unwrap();
+        assert!(matches!(
+            &header.facts[0].kind,
+            FactKind::Agent {
+                kind: AgentKind::Subagent,
+                ..
+            }
+        ));
+        assert!(run.push(r#"{"type":"model_change","id":"0b4c973d","parentId":null,"timestamp":"2026-09-12T21:48:06.495Z","provider":"openai-codex","modelId":"gpt-5.6-luna"}"#).is_none());
+        assert!(run.push(r#"{"type":"message","id":"ebf295fc","parentId":"1f420707","timestamp":"2026-09-12T21:48:35.396Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_ls","name":"bash","arguments":{"command":"ls"}}],"model":"m","usage":{"output":40}}}"#).is_none());
+
+        let label = run
+            .push(r#"{"type":"session_info","id":"22995b18","parentId":"1bab4112","timestamp":"2026-09-12T21:59:02.000Z","name":"subagent-reviewer-7c66204f-1"}"#)
+            .unwrap();
+        assert_eq!(
+            label.facts[0].kind,
+            FactKind::Label {
+                agent_type: Some("reviewer".into()),
+                description: None
+            }
+        );
+        let own = run
+            .push(r#"{"type":"message","id":"368849f0","parentId":"6442cfa6","timestamp":"2026-09-12T21:59:10.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_rv","name":"read","arguments":{"path":"/p/a.js"}}],"model":"m","usage":{"output":20}}}"#)
+            .unwrap();
+        assert!(own.facts.iter().any(|f| matches!(
+            &f.kind,
+            FactKind::ToolStart { call, .. } if call == "call_rv"
+        )));
+    }
+
+    /// A forked run's result names its top-level session file: the file's
+    /// uuid is the child's node.
+    #[test]
+    fn subagent_result_joins_a_forked_run_by_its_session_file() {
+        let mut s = Stream::new(MAIN_ID.into());
+        let done = s
+            .push(r#"{"type":"message","id":"b","parentId":"a","timestamp":"2026-08-13T11:32:07.000Z","message":{"role":"toolResult","toolCallId":"call_f","toolName":"subagent","content":[],"details":{"results":[{"agent":"reviewer","exitCode":0,"context":"fork","sessionFile":"C:\\Users\\me\\.pi\\agent\\sessions\\--p--\\2026-08-13T11-28-02-664Z_019ffae1-1468-7c46-afe5-06fd1b4ca79a.jsonl"}]},"isError":false}}"#)
+            .unwrap();
+        assert!(done.facts.iter().any(|f| f.agent.as_deref()
+            == Some("019ffae1-1468-7c46-afe5-06fd1b4ca79a")
+            && matches!(&f.kind, FactKind::Agent { spawned_by, .. } if spawned_by.as_deref() == Some("call_f"))));
     }
 
     /// The parent's side of a spawn. A `subagent` call that launches work is a

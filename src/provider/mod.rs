@@ -752,20 +752,53 @@ mod tests {
         let root_path = project.join(format!("{stem}.jsonl"));
         let run_path = project.join(stem).join("3602b259/run-0/session.jsonl");
 
+        // A run started with a forked context lives beside the root, not under it.
+        let fork_path =
+            project.join("2026-09-12T21-59-00-000Z_01a097b0-1111-7222-8333-444455556666.jsonl");
+        // A person's `/fork` of the root: a session of its own.
+        let user_fork_path =
+            project.join("2026-09-12T22-05-00-000Z_01a097b6-aaaa-7bbb-8ccc-dddddddddddd.jsonl");
+
         let s = open(&Target::Path(root_path.clone()), None).unwrap();
         assert_eq!(s.provider, Provider::Pi);
         assert_eq!(s.id, "01a09797-7e2c-7002-a725-c0a3455ef1c3");
-        assert_eq!(s.files.len(), 1);
-        assert_eq!(s.files[0].path, run_path);
-        assert!(matches!(s.files[0].role, FileRole::Agent { .. }));
+        let mut paths: Vec<&PathBuf> = s.files.iter().map(|f| &f.path).collect();
+        paths.sort();
+        let mut expected = vec![&fork_path, &run_path];
+        expected.sort();
+        assert_eq!(paths, expected);
+        assert!(
+            s.files
+                .iter()
+                .all(|f| matches!(f.role, FileRole::Agent { .. }))
+        );
 
-        let via_run = open(&Target::Path(run_path.clone()), None).unwrap();
-        assert_eq!(via_run.id, s.id);
-        assert_eq!(via_run.root.path, root_path);
+        for child in [&run_path, &fork_path] {
+            let via = open(&Target::Path(child.clone()), None).unwrap();
+            assert_eq!(via.id, s.id);
+            assert_eq!(via.root.path, root_path);
+        }
 
-        let mut stream = s.provider.stream_for(&s.files[0]);
-        let header = std::fs::read_to_string(&run_path).unwrap();
-        let st = stream.push(header.lines().next().unwrap()).unwrap();
-        assert_eq!(st.facts[0].agent.as_deref(), Some("3602b259"));
+        let own = open(&Target::Path(user_fork_path.clone()), None).unwrap();
+        assert_eq!(own.id, "01a097b6-aaaa-7bbb-8ccc-dddddddddddd");
+        assert_eq!(own.root.path, user_fork_path);
+        assert!(own.files.is_empty());
+
+        let first_line = |p: &PathBuf| {
+            std::fs::read_to_string(p)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        for (path, node) in [
+            (&run_path, "3602b259"),
+            (&fork_path, "01a097b0-1111-7222-8333-444455556666"),
+        ] {
+            let file = s.files.iter().find(|f| &f.path == path).unwrap();
+            let st = s.provider.stream_for(file).push(&first_line(path)).unwrap();
+            assert_eq!(st.facts[0].agent.as_deref(), Some(node));
+        }
     }
 }

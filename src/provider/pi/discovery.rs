@@ -4,7 +4,10 @@
 //! (pi's `docs/session-format.md`). The pi-subagents extension gives each
 //! child run a session of its own beside it, under a directory named after
 //! the root's stem: `<timestamp>_<uuid>/<run id>/run-<n>/session.jsonl`. So a
-//! path names its session, its role and its project, and nothing is read.
+//! path names its session, its role and its project. The exception is a run
+//! started with a forked context: it is a top-level session beside its
+//! parent, shaped like a root, and only its head tells it from a person's
+//! fork.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -79,12 +82,68 @@ pub fn all_paths(scope: &Scope) -> Vec<PathBuf> {
     out
 }
 
+/// What a file is. The path says most of it; a root-shaped file forked from
+/// another session is read far enough to tell a pi-subagents run started
+/// with a forked context (a run of the session it forked) from a person's
+/// fork (a session of its own).
 pub fn session_file(path: &Path) -> Option<SessionFile> {
-    classify_path(path, crate::provider::modified(path))
+    let file = classify_path(path, crate::provider::modified(path))?;
+    if file.role != FileRole::Root {
+        return Some(file);
+    }
+    match forked_run_parent(path) {
+        Some(parent) => Some(SessionFile {
+            session: parent.clone(),
+            role: FileRole::Agent { parent },
+            ..file
+        }),
+        None => Some(file),
+    }
+}
+
+/// The session a root-shaped file is a forked run of, if it is one: its
+/// header names a `parentSession`, and the first entry after the copied
+/// history (the first no older than the header) names the session as a
+/// pi-subagents run.
+fn forked_run_parent(path: &Path) -> Option<String> {
+    use std::io::{BufRead, BufReader};
+
+    #[derive(serde::Deserialize)]
+    struct Head {
+        #[serde(rename = "type")]
+        kind: String,
+        timestamp: Option<chrono::DateTime<chrono::Utc>>,
+        name: Option<String>,
+        #[serde(rename = "parentSession")]
+        parent_session: Option<String>,
+    }
+
+    let mut lines = BufReader::new(std::fs::File::open(path).ok()?).lines();
+    let header: Head = serde_json::from_str(&lines.next()?.ok()?).ok()?;
+    let parent_path = header.parent_session.filter(|_| header.kind == "session")?;
+    let parent = session_of_stem(
+        Path::new(&parent_path.replace('\\', "/"))
+            .file_stem()?
+            .to_str()?,
+    )?
+    .to_string();
+    let began = header.timestamp?;
+    for line in lines {
+        let Ok(entry) = serde_json::from_str::<Head>(&line.ok()?) else {
+            continue;
+        };
+        if entry.timestamp.is_none_or(|t| t < began) {
+            continue;
+        }
+        let is_run =
+            entry.kind == "session_info" && entry.name.is_some_and(|n| n.starts_with("subagent-"));
+        return is_run.then_some(parent);
+    }
+    None
 }
 
 /// The session id a root stem carries: `<timestamp>_<uuid>` → the uuid.
-fn session_of_stem(stem: &str) -> Option<&str> {
+pub(super) fn session_of_stem(stem: &str) -> Option<&str> {
     let (_, id) = stem.rsplit_once('_')?;
     (id.len() == 36 && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-')).then_some(id)
 }
@@ -165,18 +224,54 @@ fn runs_of(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Where the rest of a file's session is: the root, and every run beside it.
+/// Whether a path is a run directory's `session.jsonl`, rather than a
+/// top-level session file.
+fn is_run_dir_file(path: &Path) -> bool {
+    name(path) == Some("session.jsonl")
+}
+
+/// Every root-shaped file in a project directory: roots, and runs started
+/// with a forked context, which live beside their parent.
+fn top_level_sessions(project: &Path) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(project) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().is_some_and(|e| e == "jsonl")
+                && p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(session_of_stem)
+                    .is_some()
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Where the rest of a file's session is: the root, the runs under its
+/// directory, and the files beside it, which may be forked runs of it.
 pub fn related_paths(file: &SessionFile) -> Vec<PathBuf> {
     let root = match file.role {
-        FileRole::Root => file.path.clone(),
-        _ => match root_of_run(&file.path) {
-            Some(r) => r,
-            None => return Vec::new(),
-        },
+        FileRole::Root => Some(file.path.clone()),
+        _ if is_run_dir_file(&file.path) => root_of_run(&file.path),
+        _ => file.path.parent().and_then(|project| {
+            top_level_sessions(project).into_iter().find(|p| {
+                p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(session_of_stem)
+                    == Some(file.session.as_str())
+            })
+        }),
+    };
+    let Some(root) = root else {
+        return Vec::new();
     };
     let mut out = runs_of(&root);
-    if root.is_file() {
-        out.insert(0, root);
+    if let Some(project) = root.parent() {
+        out.extend(top_level_sessions(project));
     }
     out.retain(|p| *p != file.path);
     out
@@ -202,11 +297,19 @@ pub fn project_key(cwd: &Path) -> String {
 }
 
 /// The stream for one of the session's files: the root speaks as `main`, a
-/// run as its run id.
+/// run under the root's directory as its run id, a forked run beside the root
+/// as its own session uuid.
 pub fn stream_for(file: &SessionFile) -> super::Stream {
+    let own_uuid = || {
+        file.path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(session_of_stem)
+    };
     let owner = match file.role {
         FileRole::Root => MAIN_ID,
-        _ => run_of(&file.path).unwrap_or(&file.session),
+        _ if is_run_dir_file(&file.path) => run_of(&file.path).unwrap_or(&file.session),
+        _ => own_uuid().unwrap_or(&file.session),
     };
     super::Stream::new(owner.to_string())
 }
